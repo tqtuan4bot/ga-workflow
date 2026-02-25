@@ -3,7 +3,7 @@ name: Deploy to AWS
 on:
   push:
     branches:
-      - staging_agora
+      - stagging_agora
       - production
 
 jobs:
@@ -59,10 +59,11 @@ jobs:
   deploy:
     name: Deploy to ${{ github.ref_name }}
     runs-on: ubuntu-latest
-    needs: compare-branches
+    needs: [compare-branches, approve]
     if: |
-      always() && 
-      (needs.compare-branches.result == 'success' || needs.compare-branches.result == 'skipped')
+      always() &&
+      (needs.compare-branches.result == 'success' || needs.compare-branches.result == 'skipped') &&
+      (needs.approve.result == 'success' || needs.approve.result == 'skipped')
     
     permissions:
       id-token: write
