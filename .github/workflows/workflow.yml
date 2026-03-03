@@ -1,0 +1,189 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - stagging_agora
+      - production
+
+jobs:
+  compare-branches:
+    name: Compare branches
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'production'
+    outputs:
+      has_changes: ${{ steps.compare.outputs.has_changes }}
+      files_changed: ${{ steps.compare.outputs.files_changed }}
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch both branches
+        run: |
+          git fetch origin ${{ vars.STG_BRANCH }}
+          git fetch origin ${{ vars.PRD_BRANCH }}
+      
+      - name: Compare branches using git diff
+        id: compare
+        run: |
+          echo "## Compare 2 branches" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Change statistics:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          git diff --stat origin/${{ vars.PRD_BRANCH }}..origin/${{ vars.STG_BRANCH }} >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Changed files:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          git diff --name-status origin/${{ vars.PRD_BRANCH }}..origin/${{ vars.STG_BRANCH }} >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  approve:
+    name: Approve production deployment
+    runs-on: ubuntu-latest
+    needs: compare-branches
+    if: |
+      always() &&
+      (needs.compare-branches.result == 'success' || needs.compare-branches.result == 'skipped') &&
+      github.ref_name == 'production'
+    environment:
+      name: production
+    steps:
+      - name: Waiting for approval
+        run: echo "Deployment to production approved ✅"
+
+  deploy:
+    name: Deploy to ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    needs: [compare-branches, approve]
+    if: |
+      always() &&
+      (needs.compare-branches.result == 'success' || needs.compare-branches.result == 'skipped') &&
+      (needs.approve.result == 'success' || needs.approve.result == 'skipped')
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.OIDC_ROLE }}
+          aws-region:  ${{ vars.REGION }}
+          role-session-name: GitHubActions-Deploy-${{ github.ref_name }}
+      
+      - name: Set deployment environment
+        id: set-env
+        run: |
+          if [ "${{ github.ref_name }}" == "${{ vars.STG_BRANCH }}" ]; then
+            echo "environment=STG" >> $GITHUB_OUTPUT
+            echo "env_name=Staging" >> $GITHUB_OUTPUT
+            echo "ga_tag=${{ vars.STG_LOGIN_SERVER_TAG }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_name }}" == "${{ vars.PRD_BRANCH }}" ]; then
+            echo "environment=PRD" >> $GITHUB_OUTPUT
+            echo "env_name=Production" >> $GITHUB_OUTPUT
+            echo "ga_tag=${{ vars.PRD_LOGIN_SERVER_TAG }}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Display deployment info
+        run: |
+          echo "Deploying to: ${{ steps.set-env.outputs.env_name }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Target tag: ${{ steps.set-env.outputs.ga_tag }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Commit: ${{ github.sha }}"
+          
+      - name: Get target instance
+        id: get-instance
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:ga_tag,Values=${{ steps.set-env.outputs.ga_tag }}" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+          
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "Target instance: $INSTANCE_ID"
+
+      - name: Deploy API Server
+        id: deploy-api
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "${{ steps.get-instance.outputs.instance_id }}" \
+            --parameters commands='["${{ vars.DEPLOY_API_COMMAND }}"]' \
+            --timeout-seconds 600 \
+            --comment "Deploy API - Branch: ${{ github.ref_name }} - Commit: ${{ github.sha }}" \
+            --cloud-watch-output-config '{"CloudWatchLogGroupName":"/aws/ssm/deploy-logs/api-stg","CloudWatchOutputEnabled":true}' \
+            --output text \
+            --query "Command.CommandId")
+          
+          echo "api_command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
+          echo "API deployment command sent: $COMMAND_ID"
+      
+      - name: Wait for API deployment
+        run: |
+          echo "Waiting for API deployment to complete..."
+          aws ssm wait command-executed \
+            --command-id "${{ steps.deploy-api.outputs.api_command_id }}" \
+            --instance-id "${{ steps.get-instance.outputs.instance_id }}"
+          
+          echo "API deployment completed"
+      
+      - name: Deploy Task Schedule Server
+        id: deploy-taskschedule
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "${{ steps.get-instance.outputs.instance_id }}" \
+            --parameters commands='["${{ vars.DEPLOY_TASKSCHEDULE_COMMAND }}"]' \
+            --timeout-seconds 600 \
+            --comment "Deploy TaskSchedule - Branch: ${{ github.ref_name }} - Commit: ${{ github.sha }}" \
+            --cloud-watch-output-config '{"CloudWatchLogGroupName":"/aws/ssm/deploy-logs/task-schedule-stg","CloudWatchOutputEnabled":true}' \
+            --output text \
+            --query "Command.CommandId")
+          
+          echo "taskschedule_command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
+          echo "TaskSchedule deployment command sent: $COMMAND_ID"
+      
+      - name: Wait for TaskSchedule deployment
+        run: |
+          echo "Waiting for TaskSchedule deployment to complete..."
+          aws ssm wait command-executed \
+            --command-id "${{ steps.deploy-taskschedule.outputs.taskschedule_command_id }}" \
+            --instance-id "${{ steps.get-instance.outputs.instance_id }}"
+          
+          echo "TaskSchedule deployment completed"
+      
+      - name: Get deployment results
+        if: always()
+        run: |
+          echo "## Deployment Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### API Deployment Output:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.deploy-api.outputs.api_command_id }}" \
+            --instance-id "${{ steps.get-instance.outputs.instance_id }}" \
+            --query 'StandardOutputContent' \
+            --output text >> $GITHUB_STEP_SUMMARY 2>&1 || echo "No output" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### TaskSchedule Deployment Output:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.deploy-taskschedule.outputs.taskschedule_command_id }}" \
+            --instance-id "${{ steps.get-instance.outputs.instance_id }}" \
+            --query 'StandardOutputContent' \
+            --output text >> $GITHUB_STEP_SUMMARY 2>&1 || echo "No output" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
